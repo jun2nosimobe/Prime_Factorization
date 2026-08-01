@@ -123,6 +123,24 @@ public:
 };
 // =================================================================
 
+// =================================================================
+// 【将来実装】384ビット専用の固定長整数とCIOSモントゴメリコンテキスト
+// =================================================================
+struct uint384_t {
+    // 次回ここに実装を追加します
+    uint384_t() {}
+    uint384_t(int v) {}
+    uint384_t(const std::string& s) {}
+    std::string str() const { return "not implemented"; }
+    bool operator==(int b) const { return false; }
+    // ...
+};
+
+struct MontgomeryContext384 {
+    MontgomeryContext384(const uint384_t& modulus) {}
+    // 次回ここに実装を追加します
+};
+
 // Boostの gcd をエミュレートするグローバル関数
 inline cpp_int gcd(const cpp_int& a, const cpp_int& b) {
     cpp_int r;
@@ -252,6 +270,7 @@ struct MontgomeryContext {
 
         mont_mul_raw(out.Z.get_mpz_t(), t5, t6);
     }
+    
 };
 
 // --- 追加: 計算状態を記録する構造体（射影座標版） ---

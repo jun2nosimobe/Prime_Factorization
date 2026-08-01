@@ -29,6 +29,23 @@
         .math-detail { background: #113311; color: #aaffaa; padding: 10px; margin: 5px 0; border-left: 4px solid #00e676; font-family: "Courier New", monospace;}
         .final-result { color: #00bcd4; font-weight: bold; font-size: 1.4em; margin-top: 15px; border-top: 1px dashed #555; padding-top: 15px;}
         .dim { color: #666; }
+        /* ターミナルのログ行レイアウト用 */
+        .log-row { 
+            display: flex; 
+            align-items: flex-start; 
+            margin-bottom: 2px;
+        }
+        .log-time { 
+            flex: 0 0 90px; /* 時間列の幅を固定 */
+            color: #777; 
+            font-family: "Courier New", monospace; 
+            font-size: 0.9em; 
+            user-select: none; /* タイムスタンプはコピペされないようにする */
+        }
+        .log-msg { 
+            flex: 1; 
+            word-break: break-all; /* 長い数式も折り返す */
+        }
     </style>
 </head>
 <body>
@@ -65,11 +82,12 @@
         
         let stopRequested = false;
         startBtn.disabled = true;
+        let startTime = 0;
         
         // -------------------------------------------------
         // Workerプールの管理と強制リセット機能
         // -------------------------------------------------
-        const MAX_WORKERS = navigator.hardwareConcurrency || 4;
+        const MAX_WORKERS = Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)); //コアの数
         let workers = [];
         let readyWorkers = 0;
         let idleWorkers = []; 
@@ -80,14 +98,59 @@
 
         function appendLog(text, className = "") {
             const div = document.createElement('div');
-            div.innerHTML = text;
-            if (className) div.className = className;
+            div.className = 'log-row'; // 行全体のFlexコンテナ
+
+            // 経過時間の計算 (startTimeからの差分)
+            let elapsedStr = "[00:00:00]";
+            if (startTime > 0) {
+                let elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+                let hh = String(Math.floor(elapsedSeconds / 3600)).padStart(2, '0');
+                let mm = String(Math.floor((elapsedSeconds % 3600) / 60)).padStart(2, '0');
+                let ss = String(elapsedSeconds % 60).padStart(2, '0');
+                elapsedStr = `[${hh}:${mm}:${ss}]`;
+            }
+
+            // 元のテキストの先頭に改行 (\n や <br>) がある場合、
+            // カラムごと下がるのを防ぐため、先頭の改行を削除して行の上にマージン(余白)を設定する
+            let hasTopMargin = false;
+            if (text.startsWith('\n') || text.startsWith('<br>')) {
+                hasTopMargin = true;
+                text = text.replace(/^(<br>|\n)+/, ''); // 先頭の改行を削除
+            }
+            if (hasTopMargin) {
+                div.style.marginTop = "15px";
+            }
+
+            // 時間列とメッセージ列を分離して流し込む
+            div.innerHTML = `
+                <div class="log-time">${elapsedStr}</div>
+                <div class="log-msg ${className}">${text}</div>
+            `;
+            
             terminal.appendChild(div);
             terminal.scrollTop = terminal.scrollHeight;
         }
 
+        // --- タイマーとステータス表示の管理 ---
+        let currentStatusText = "待機中...";
+        let globalTimer = null;
+
+        function updateStatusDisplay() {
+            let elapsedText = "";
+            if (startTime > 0 && startBtn.disabled) { // 実行中のみタイマー表示
+                let elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+                let hh = String(Math.floor(elapsedSeconds / 3600)).padStart(2, '0');
+                let mm = String(Math.floor((elapsedSeconds % 3600) / 60)).padStart(2, '0');
+                let ss = String(elapsedSeconds % 60).padStart(2, '0');
+                elapsedText = `<span style="float: right; color: #ffeb3b; font-family: monospace;">⏱ 経過時間: ${hh}:${mm}:${ss}</span>`;
+            }
+            // textContent ではなく innerHTML でHTMLタグごと流し込む
+            statusBar.innerHTML = currentStatusText + elapsedText;
+        }
+
         function updateStatus(text) {
-            statusBar.textContent = text;
+            currentStatusText = text;
+            updateStatusDisplay();
         }
 
         // ★修正: 停止時や完了時にWorkerを完全に破棄してCPUを解放できるように引数を追加
@@ -145,7 +208,6 @@
         let unprocessed = [];
         let primeFactors = [];
         let currentN = null;
-        let startTime = 0;
         
         let ecmPhases = [
             { B1: 2000,      maxCurves: 25,    batchSize: 5 },
@@ -185,6 +247,10 @@
             primeFactors = [];
             currentN = null;
             startTime = Date.now();
+
+            // ★追加: 1秒ごとにステータスバーのタイマー表示を更新
+            if (globalTimer) clearInterval(globalTimer);
+            globalTimer = setInterval(updateStatusDisplay, 1000);
 
             processNextTarget();
         };
@@ -391,6 +457,8 @@
         }
 
         function finish(primes, composites) {
+            if (globalTimer) clearInterval(globalTimer);
+            
             primes.sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)));
             composites.sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)));
             
