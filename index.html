@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <title>素因数分解アルゴリズム デモ</title>
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: monospace; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .controls { background: #1e1e1e; padding: 15px; border-radius: 5px; margin-bottom: 15px; border: 1px solid #333;}
+        input[type="text"] { padding: 8px; font-size: 16px; width: 300px; background: #333; color: #fff; border: 1px solid #555; }
+        button { padding: 10px 15px; font-size: 16px; margin: 5px; cursor: pointer; background: #007bff; color: white; border: none; font-weight: bold; border-radius: 4px;}
+        button:hover { background: #0056b3; }
+        button:disabled { background: #555; cursor: not-allowed; }
+        
+        /* ラジオボタン用のスタイル */
+        .mode-selector { margin: 15px 0; font-size: 16px; }
+        .mode-selector label { margin-right: 20px; cursor: pointer; }
+
+        /* コンソールのスタイル */
+        #status-bar { background: #002244; color: #66ccff; padding: 10px; font-weight: bold; border-radius: 4px 4px 0 0; border: 1px solid #333; border-bottom: none;}
+        #terminal { 
+            background: #000; color: #ccc; padding: 15px; border-radius: 0 0 4px 4px; 
+            height: 450px; overflow-y: auto; font-size: 14px; line-height: 1.6; 
+            border: 1px solid #333;
+        }
+        
+        .highlight { color: #ffeb3b; font-weight: bold; }
+        .success { color: #00e676; font-weight: bold; font-size: 1.1em; padding: 5px 0;}
+        .math-detail { background: #113311; color: #aaffaa; padding: 10px; margin: 5px 0; border-left: 4px solid #00e676; font-family: "Courier New", monospace;}
+        .final-result { color: #00bcd4; font-weight: bold; font-size: 1.4em; margin-top: 15px; border-top: 1px dashed #555; padding-top: 15px;}
+        .dim { color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>アルゴリズム比較: 素因数分解</h1>
+        
+        <div class="controls">
+            <div>
+                <label>ターゲット N: </label>
+                <input type="text" id="targetN" value="13180295982833324021"/>
+            </div>
+            
+            <div class="mode-selector">
+                <strong>アルゴリズム選択: </strong>
+                <label><input type="radio" name="algoMode" value="hybrid" checked> ECM + ロー法 (実践向け)</label>
+                <label><input type="radio" name="algoMode" value="rho_only"> ロー法のみ (比較用)</label>
+                <label><input type="radio" name="algoMode" value="ecm_only"> ECMのみ (比較用)</label>
+            </div>
+            
+            <button id="startBtn">分解スタート</button>
+            <button id="stopBtn" disabled>停止</button>
+        </div>
+
+        <div id="status-bar">待機中...</div>
+        <div id="terminal"></div>
+    </div>
+
+    <script src="ecm_module.js"></script>
+    <script>
+        const terminal = document.getElementById('terminal');
+        const statusBar = document.getElementById('status-bar');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        
+        let stopRequested = false;
+        startBtn.disabled = true;
+        
+        // -------------------------------------------------
+        // Workerプールの管理と強制リセット機能
+        // -------------------------------------------------
+        const MAX_WORKERS = navigator.hardwareConcurrency || 4;
+        let workers = [];
+        let readyWorkers = 0;
+        let idleWorkers = []; 
+        let mainThreadReady = false;
+
+        function appendLog(text, className = "") {
+            const div = document.createElement('div');
+            div.innerHTML = text;
+            if (className) div.className = className;
+            terminal.appendChild(div);
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+
+        function updateStatus(text) {
+            statusBar.textContent = text;
+        }
+
+        // Workerプールをゼロから構築（再起動）する関数
+        function initWorkers(isRestart = false) {
+            if (isRestart) {
+                // 既存のWorkerをすべて強制終了（CPUリソースを即時解放）
+                workers.forEach(w => w.terminate());
+                workers = [];
+                idleWorkers = [];
+                readyWorkers = 0;
+            } else {
+                appendLog(`[システム] CPUコア数を検知: ${MAX_WORKERS} スレッドで並列処理モードを準備中...`, "dim");
+            }
+
+            for (let i = 0; i < MAX_WORKERS; i++) {
+                const worker = new Worker('ecm_worker.js');
+                worker.onmessage = function(e) {
+                    if (e.data.type === 'ready') {
+                        readyWorkers++;
+                        idleWorkers.push(i);
+                        if (mainThreadReady && readyWorkers === MAX_WORKERS) {
+                            if (!isRestart) {
+                                appendLog(`[システム] メインスレッド ＆ 全 ${MAX_WORKERS} スレッドの初期化完了。`, "success");
+                                startBtn.disabled = false;
+                                updateStatus("待機中... (準備完了)");
+                            } else {
+                                // 再起動時はすぐに次のターゲットの処理を再開
+                                setTimeout(processNextTarget, 10);
+                            }
+                        }
+                    } else if (e.data.type === 'result') {
+                        handleWorkerResult(e.data);
+                    }
+                };
+                workers.push(worker);
+            }
+        }
+
+        Module.onRuntimeInitialized = function() {
+            mainThreadReady = true;
+            if (readyWorkers === MAX_WORKERS) {
+                appendLog(`[システム] メインスレッド ＆ 全 ${MAX_WORKERS} スレッドの初期化完了。`, "success");
+                startBtn.disabled = false;
+                updateStatus("待機中... (準備完了)");
+            }
+        };
+
+        // 初回起動
+        initWorkers();
+
+        // -------------------------------------------------
+        // グローバルな状態管理と深層探索スケール
+        // -------------------------------------------------
+        let unprocessed = [];
+        let primeFactors = [];
+        let currentN = null;
+        let startTime = 0;
+        
+        // 70桁〜100桁（35〜50桁の素因数）を撃ち抜くためのガチ勢用スケール
+        // B1が巨大になると1曲線の計算に時間がかかるため、batchSizeを減らしてUIの更新頻度を保ちます
+        let ecmPhases = [
+            { B1: 2000,      maxCurves: 25,    batchSize: 2 },   // ~15桁の素因数
+            { B1: 11000,     maxCurves: 90,    batchSize: 2 },  // ~20桁
+            { B1: 50000,     maxCurves: 300,   batchSize: 2 },  // ~25桁
+            { B1: 250000,    maxCurves: 700,   batchSize: 2 },  // ~30桁
+            { B1: 1000000,   maxCurves: 1800,  batchSize: 2 },  // ~35桁
+            { B1: 3000000,   maxCurves: 4000,  batchSize: 2 },  // ~40桁 (ここから先は非常に重い)
+            { B1: 11000000,  maxCurves: 8000,  batchSize: 2 },   // ~45桁
+            { B1: 43000000,  maxCurves: 20000, batchSize: 2 }    // ~50桁
+        ];
+        let currentPhaseIdx = 0;
+        let B1 = ecmPhases[0].B1;
+        let curvesTriedInPhase = 0;
+        let totalCurves = 0;
+        let targetResolved = false; 
+
+        // -------------------------------------------------
+        // コア・ロジック
+        // -------------------------------------------------
+        startBtn.onclick = function() {
+            const n_str = document.getElementById('targetN').value.trim();
+            if(!n_str || !/^\d+$/.test(n_str)) {
+                alert("正しい数値を入力してください。");
+                return;
+            }
+            terminal.innerHTML = "";
+            appendLog(`=== N = ${n_str} の完全分解を開始 ===`, "highlight");
+            appendLog(`[システム] ${MAX_WORKERS} コアのフルパワーで実行します`, "highlight");
+            
+            stopRequested = false;
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            
+            unprocessed = [BigInt(n_str)];
+            primeFactors = [];
+            currentN = null;
+            startTime = Date.now();
+
+            processNextTarget();
+        };
+
+        stopBtn.onclick = function() { 
+            stopRequested = true; 
+        };
+
+        function processNextTarget() {
+            if (stopRequested) {
+                finish(primeFactors, unprocessed.concat(currentN ? [currentN] : []));
+                return;
+            }
+            if (unprocessed.length === 0) {
+                finish(primeFactors, []);
+                return;
+            }
+            
+            currentN = unprocessed.shift();
+            targetResolved = false;
+            
+            if (currentN < 1000n) {
+                appendLog(`\n>>> ターゲット: ${currentN} (小数のため試行除法で処理) <<<`, "highlight");
+                let found = false;
+                for (let d = 2n; d * d <= currentN; d++) {
+                    if (currentN % d === 0n) {
+                        const q = currentN / d;
+                        appendLog(`🎉 <b>試行除法で発見:</b> ${currentN} = ${d} × ${q}`, "success");
+                        if (d > 1n) unprocessed.push(d);
+                        if (q > 1n) unprocessed.push(q);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    appendLog(`[確認] ${currentN} は素数です。`, "highlight");
+                    primeFactors.push(currentN);
+                }
+                currentN = null;
+                setTimeout(processNextTarget, 10);
+                return;
+            }
+            
+            if (Module.is_prime_cpp(currentN.toString())) {
+                appendLog(`[確認] ${currentN} は素数です。`, "highlight");
+                primeFactors.push(currentN);
+                currentN = null; 
+                setTimeout(processNextTarget, 10);
+                return;
+            }
+            
+            appendLog(`\n>>> ターゲット: ${currentN} <<<`, "highlight");
+            totalCurves = 0;
+            currentPhaseIdx = 0;
+            B1 = ecmPhases[0].B1;
+            curvesTriedInPhase = 0;
+            
+            const mode = document.querySelector('input[name="algoMode"]:checked').value;
+            if (mode === "hybrid" || mode === "rho_only") {
+                updateStatus(`[ロー法] 小さな素因数を探索中...`);
+                appendLog(`<span class="dim">ポラード・ロー法 (x = x^2 + c mod N) で探索中...</span>`);
+                
+                let steps = (mode === "rho_only") ? 5000000 : 100000;
+                const factor_str = Module.pollard_rho(currentN.toString(), steps);
+                
+                if (factor_str !== "") {
+                    const p = BigInt(factor_str);
+                    const q = currentN / p;
+                    appendLog(`🎉 <b>ロー法で発見:</b> ${currentN} = ${p} × ${q}`, "success");
+                    if (p > 1n) unprocessed.push(p);
+                    if (q > 1n) unprocessed.push(q);
+                    currentN = null;
+                    setTimeout(processNextTarget, 10);
+                    return;
+                } else {
+                    if (mode === "rho_only") {
+                        appendLog(`❌ ロー法では時間内に見つかりませんでした。`, "highlight");
+                        unprocessed.push(currentN);
+                        currentN = null;
+                        stopRequested = true;
+                        setTimeout(processNextTarget, 10);
+                        return;
+                    } else {
+                        appendLog(`<span class="dim">  -> ロー法では見つからず。ECMに並列移行します。</span>`);
+                    }
+                }
+            }
+            dispatchJobs();
+        }
+
+        function dispatchJobs() {
+            if (targetResolved || stopRequested) return;
+
+            const batchSize = ecmPhases[currentPhaseIdx].batchSize;
+            
+            while (idleWorkers.length > 0) {
+                const workerId = idleWorkers.shift();
+                const seed = Math.floor(Math.random() * 1000000000);
+                
+                workers[workerId].postMessage({
+                    cmd: 'run_ecm',
+                    workerId: workerId,
+                    n_str: currentN.toString(),
+                    B1: B1,
+                    seed: seed,
+                    num_curves: batchSize
+                });
+            }
+        }
+
+        function handleWorkerResult(result) {
+            // すでに他スレッドで発見済みなら無視（※再起動までのラグ用）
+            if (targetResolved || stopRequested) return;
+
+            totalCurves += result.curves_tried;
+            curvesTriedInPhase += result.curves_tried;
+            updateStatus(`[ECM並列] フェーズ${currentPhaseIdx+1} (B1=${B1}) | 試行曲線: ${totalCurves} 個目`);
+
+            if (result.status === "found") {
+                targetResolved = true; 
+                
+                const p = BigInt(result.factor);
+                const q = currentN / p;
+                
+                appendLog(`🎉 <b>ECMで素因数発見！</b> (曲線ガチャ ${totalCurves}回目で的中)`, "success");
+                
+                let detailHtml = `<b>[アルゴリズム詳細解説]</b><br>`;
+                detailHtml += `ターゲット: N = ${currentN}<br><br>`;
+                detailHtml += `ヒットした曲線 (A24): A = ${result.A}<br>`;
+                
+                if (result.phase === 1) {
+                    detailHtml += `<b style="color:#66ccff;">【フェーズ1 (B1) で的中】</b><br>`;
+                    detailHtml += `素数 <b style="color:white">${result.prime}</b> のべき乗（k = ${result.k}）によるスカラー倍完了時に発覚。<br>`;
+                } else {
+                    detailHtml += `<b style="color:#ff66b2;">【フェーズ2 (多点評価) で的中】</b><br>`;
+                    detailHtml += `FFTベースの多項式剰余ツリー評価中に衝突を検知！<br>`;
+                }
+                
+                detailHtml += `・Z座標（または評価値累積）: <span style="font-size: 0.8em; word-break: break-all;">Z = ${result.Z}</span><br><br>`;
+                detailHtml += `<span style="color:#00e676; font-size: 1.1em;"><b>GCD( Z, N ) = ${p} > 1</b></span> となりました！<br>`;
+                
+                appendLog(detailHtml, "math-detail");
+                appendLog(`${currentN} = ${p} × ${q}`, "success");
+                
+                if (p > 1n) unprocessed.push(p);
+                if (q > 1n) unprocessed.push(q);
+                currentN = null;
+                
+                // ★ 改善ポイント: 素因数発見と同時に、重い計算をしている全Workerを強制Killして作り直す
+                appendLog(`[システム] 他スレッドの重い計算を強制中断し、Workerを再起動します...`, "dim");
+                initWorkers(true); 
+
+            } else {
+                idleWorkers.push(result.workerId);
+                
+                if (curvesTriedInPhase >= ecmPhases[currentPhaseIdx].maxCurves) {
+                    currentPhaseIdx++;
+                    if (currentPhaseIdx < ecmPhases.length) {
+                        B1 = ecmPhases[currentPhaseIdx].B1;
+                        curvesTriedInPhase = 0;
+                        appendLog(`<span class="dim">...限界曲数到達。B1を ${B1} に引き上げてさらに並列探索します</span>`);
+                    } else {
+                        currentPhaseIdx = 0;
+                        B1 = ecmPhases[0].B1;
+                        curvesTriedInPhase = 0;
+                        appendLog(`<span class="dim">...一周完了。新しい曲線セットで初期フェーズから再挑戦します</span>`);
+                    }
+                }
+                dispatchJobs();
+            }
+        }
+
+        function finish(primes, composites) {
+            primes.sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)));
+            composites.sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)));
+            
+            let resultElements = [];
+            primes.forEach(p => resultElements.push(p.toString()));
+            composites.forEach(c => resultElements.push(`[未分解:${c}]`));
+            
+            const equation = `${document.getElementById('targetN').value.trim()} = ${resultElements.join(" × ")}`;
+            appendLog(`<br>=== 最終結果 ===`, "final-result");
+            appendLog(equation, "final-result");
+            
+            let timeTaken = (Date.now() - startTime) / 1000;
+            updateStatus(`完了 (所要時間: ${timeTaken.toFixed(2)} 秒)`);
+            
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            appendLog("\n🛑 処理が完了しました。");
+        }
+    </script>
+</body>
+</html>
