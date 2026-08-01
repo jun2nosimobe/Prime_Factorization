@@ -4,9 +4,8 @@
 #include <cstdlib>
 #include <vector>
 #include <map>
-
-// Boostの代わりにmini-gmpをインクルード
-#include "mini-gmp.h"
+#include <gmp.h>
+#include <numeric> // std::gcd用に追加
 
 using namespace emscripten;
 
@@ -132,23 +131,34 @@ inline cpp_int gcd(const cpp_int& a, const cpp_int& b) {
 }
 // =======================================================
 
-// --- モントゴメリ乗算用クラス・ヘルパー ---
+
+// --- モントゴメリ曲線用のX, Z座標のみの構造体 ---
+struct PointXZ {
+    cpp_int X, Z;
+};
+
+// --- モントゴメリ乗算用クラス・ヘルパー (ゼロ・アロケーション最適化版) ---
 struct MontgomeryContext {
     cpp_int n;
     cpp_int r;     
     int r_bits;    
-    cpp_int mask;  // ★必須: 下位ビット抽出用マスク
+    cpp_int mask;  
     cpp_int n_prime; 
     
+    // 事前確保バッファ（malloc/freeを完全に防ぐ）
+    mutable mpz_t tmp_t, tmp_m, tmp_u, tmp_temp;
+    mutable mpz_t t1, t2, t3, t4, t5, t6; // ★追加: xADD/xDBL 専用の使い回しバッファ
+    
     MontgomeryContext(const cpp_int& modulus) {
+        mpz_init(tmp_t); mpz_init(tmp_m); mpz_init(tmp_u); mpz_init(tmp_temp);
+        mpz_init(t1); mpz_init(t2); mpz_init(t3); mpz_init(t4); mpz_init(t5); mpz_init(t6);
+        
         n = modulus;
         int bits = 0;
         cpp_int temp = n;
         while (temp > 0) { bits++; temp >>= 1; }
         r_bits = ((bits + 63) / 64) * 64;
         r = cpp_int(1) << r_bits;
-        
-        // ★修正: 正しいマスク (2^r_bits - 1) を生成
         mask = (cpp_int(1) << r_bits) - 1;
         
         cpp_int t = 0, newt = 1;
@@ -164,23 +174,83 @@ struct MontgomeryContext {
         n_prime = (r - t) % r;
     }
 
-    cpp_int to_mont(const cpp_int& a) const {
-        return (a << r_bits) % n;
+    ~MontgomeryContext() {
+        mpz_clear(tmp_t); mpz_clear(tmp_m); mpz_clear(tmp_u); mpz_clear(tmp_temp);
+        mpz_clear(t1); mpz_clear(t2); mpz_clear(t3); mpz_clear(t4); mpz_clear(t5); mpz_clear(t6);
     }
 
-    cpp_int from_mont(const cpp_int& a) const {
-        return mont_mul(a, 1);
-    }
+    cpp_int to_mont(const cpp_int& a) const { return (a << r_bits) % n; }
+    cpp_int from_mont(const cpp_int& a) const { return mont_mul(a, 1); }
 
+    // 外部（C++コード）から呼ばれる用のラッパー
     cpp_int mont_mul(const cpp_int& a, const cpp_int& b) const {
-        cpp_int t = a * b;
-        // ★修正: -1 が抜けていた誤った式を削除し、正しく mask を使用する
-        cpp_int m = cpp_int((t * n_prime) & mask);
-        cpp_int u = cpp_int(t + m * n) >> r_bits; 
-        if (u >= n) {
-            u -= n;
+        cpp_int res;
+        mont_mul_raw(res.get_mpz_t(), a.get_mpz_t(), b.get_mpz_t());
+        return res;
+    }
+
+    // =================================================================
+    // ★ 内部計算用の超高速 raw 関数群 (割り算レス & インプレース)
+    // =================================================================
+    void mont_mul_raw(mpz_t res, const mpz_t a, const mpz_t b) const {
+        mpz_mul(tmp_t, a, b);
+        mpz_mul(tmp_temp, tmp_t, n_prime.get_mpz_t());
+        mpz_and(tmp_m, tmp_temp, mask.get_mpz_t());
+        mpz_mul(tmp_temp, tmp_m, n.get_mpz_t());
+        mpz_add(tmp_temp, tmp_t, tmp_temp);
+        mpz_fdiv_q_2exp(tmp_u, tmp_temp, r_bits);
+        if (mpz_cmp(tmp_u, n.get_mpz_t()) >= 0) {
+            mpz_sub(tmp_u, tmp_u, n.get_mpz_t());
         }
-        return u;
+        mpz_set(res, tmp_u);
+    }
+
+    void add_mod_raw(mpz_t res, const mpz_t a, const mpz_t b) const {
+        mpz_add(res, a, b);
+        if (mpz_cmp(res, n.get_mpz_t()) >= 0) mpz_sub(res, res, n.get_mpz_t());
+    }
+
+    void sub_mod_raw(mpz_t res, const mpz_t a, const mpz_t b) const {
+        mpz_sub(res, a, b);
+        if (mpz_sgn(res) < 0) mpz_add(res, res, n.get_mpz_t());
+    }
+
+    // =================================================================
+    // ★ 究極の xADD / xDBL (結果を参照渡しして alloc を完全に回避)
+    // =================================================================
+    void xADD(PointXZ& out, const PointXZ& P, const PointXZ& Q, const PointXZ& P_minus_Q) const {
+        sub_mod_raw(t1, P.X.get_mpz_t(), P.Z.get_mpz_t());
+        add_mod_raw(t2, Q.X.get_mpz_t(), Q.Z.get_mpz_t());
+        mont_mul_raw(t3, t1, t2);
+
+        add_mod_raw(t1, P.X.get_mpz_t(), P.Z.get_mpz_t());
+        sub_mod_raw(t2, Q.X.get_mpz_t(), Q.Z.get_mpz_t());
+        mont_mul_raw(t4, t1, t2);
+
+        add_mod_raw(t5, t3, t4);
+        sub_mod_raw(t6, t3, t4);
+
+        mont_mul_raw(t1, t5, t5);
+        mont_mul_raw(out.X.get_mpz_t(), P_minus_Q.Z.get_mpz_t(), t1);
+
+        mont_mul_raw(t2, t6, t6);
+        mont_mul_raw(out.Z.get_mpz_t(), P_minus_Q.X.get_mpz_t(), t2);
+    }
+
+    void xDBL(PointXZ& out, const PointXZ& P, const cpp_int& A24_mont) const {
+        add_mod_raw(t1, P.X.get_mpz_t(), P.Z.get_mpz_t());
+        sub_mod_raw(t2, P.X.get_mpz_t(), P.Z.get_mpz_t());
+
+        mont_mul_raw(t3, t1, t1);
+        mont_mul_raw(t4, t2, t2);
+        sub_mod_raw(t5, t3, t4);
+
+        mont_mul_raw(out.X.get_mpz_t(), t3, t4);
+
+        mont_mul_raw(t6, A24_mont.get_mpz_t(), t5);
+        add_mod_raw(t6, t4, t6);
+
+        mont_mul_raw(out.Z.get_mpz_t(), t5, t6);
     }
 };
 
@@ -205,6 +275,31 @@ cpp_int mod(cpp_int a, cpp_int n) {
 // --- 追加: グローバルな素数キャッシュ ---
 std::vector<int> cached_primes;
 int max_sieved_B1 = 1;
+
+// 定数ではなく、動的に書き換えるグローバル変数に変更
+int current_phase2_D = 0;
+std::vector<int> current_phase2_coprimes;
+
+// B2 のサイズに応じて最適な D を選び、Baby-step のリストを自動生成する
+void setup_phase2_params(int B2) {
+    int target_D = 210;
+    if (B2 > 50000000) target_D = 510510;       // 2 * 3 * 5 * 7 * 11 * 13 * 17
+    else if (B2 > 2000000) target_D = 30030;    // 2 * 3 * 5 * 7 * 11 * 13
+    else if (B2 > 50000) target_D = 2310;       // 2 * 3 * 5 * 7 * 11
+    
+    // すでに計算済みならスキップ
+    if (current_phase2_D == target_D) return;
+    
+    current_phase2_D = target_D;
+    current_phase2_coprimes.clear();
+    
+    // D/2 以下の、D と互いに素な整数をすべてリストアップ（これがそのまま素数＆合成数の探索候補になる）
+    for (int i = 1; i <= target_D / 2; i += 2) {
+        if (std::gcd(i, target_D) == 1) {
+            current_phase2_coprimes.push_back(i);
+        }
+    }
+}
 
 // 必要なB1までエラトステネスの篩で素数テーブルを構築・拡張する
 void ensure_primes_up_to(int B1) {
@@ -303,6 +398,31 @@ cpp_int modInverse(cpp_int a, cpp_int m) {
     return x;
 }
 
+// --- モントゴメリのバッチ逆元 (一括逆元計算) ---
+// 複数のZ座標の逆元を、1回の modInverse でまとめて計算する超高速化手法
+bool batch_inverse(std::vector<cpp_int>& vec, const cpp_int& N) {
+    int n = vec.size();
+    if (n == 0) return true;
+    std::vector<cpp_int> prod(n);
+    cpp_int acc = 1;
+    for (int i = 0; i < n; ++i) {
+        prod[i] = acc;
+        acc = (acc * vec[i]) % N;
+    }
+    cpp_int acc_inv = modInverse(acc, N);
+    
+    // 逆元計算中に素因数を引き当てた場合
+    if (global_ecm_state.found_factor > 0) return false;
+    
+    for (int i = n - 1; i >= 0; --i) {
+        cpp_int current = vec[i];
+        vec[i] = (acc_inv * prod[i]) % N;
+        if (vec[i] < 0) vec[i] += N;
+        acc_inv = (acc_inv * current) % N;
+    }
+    return true;
+}
+
 // --- (追加) ポラード・ロー法 ---
 // 小さな素因数を高速に探索する。見つかったらその文字列表現を、見つからなければ空文字を返す。
 std::string pollard_rho(const std::string& n_str, int max_steps) {
@@ -336,69 +456,25 @@ std::string pollard_rho(const std::string& n_str, int max_steps) {
 }
 
 
-
-
-// --- モントゴメリ曲線用のX, Z座標のみの構造体 ---
-struct PointXZ {
-    cpp_int X, Z;
-};
-
-// モントゴメリ・ラダー: 差分加算 (xADD)
-PointXZ xADD(const PointXZ& P, const PointXZ& Q, const PointXZ& P_minus_Q, const MontgomeryContext& ctx, const cpp_int& N) {
-    cpp_int U = mod(P.X - P.Z, N);
-    cpp_int V = mod(Q.X + Q.Z, N);
-    cpp_int U_V = ctx.mont_mul(U, V);
-    
-    cpp_int W = mod(P.X + P.Z, N);
-    cpp_int Y = mod(Q.X - Q.Z, N);
-    cpp_int W_Y = ctx.mont_mul(W, Y);
-    
-    cpp_int sum = mod(U_V + W_Y, N);
-    cpp_int diff = mod(U_V - W_Y, N);
-    
-    cpp_int X_plus = ctx.mont_mul(P_minus_Q.Z, ctx.mont_mul(sum, sum));
-    cpp_int Z_plus = ctx.mont_mul(P_minus_Q.X, ctx.mont_mul(diff, diff));
-    
-    return {X_plus, Z_plus};
-}
-
-// モントゴメリ・ラダー: 2倍算 (xDBL)
-PointXZ xDBL(const PointXZ& P, const cpp_int& A24_mont, const MontgomeryContext& ctx, const cpp_int& N) {
-    cpp_int U = mod(P.X + P.Z, N);
-    cpp_int V = mod(P.X - P.Z, N);
-    
-    cpp_int U2 = ctx.mont_mul(U, U);
-    cpp_int V2 = ctx.mont_mul(V, V);
-    
-    cpp_int diff = mod(U2 - V2, N);
-    
-    cpp_int X_out = ctx.mont_mul(U2, V2);
-    cpp_int term = mod(V2 + ctx.mont_mul(A24_mont, diff), N);
-    cpp_int Z_out = ctx.mont_mul(diff, term);
-    
-    return {X_out, Z_out};
-}
-
-// モントゴメリ・ラダーによる超高速スカラー倍
+// モントゴメリ・ラダーによる超高速スカラー倍 (Zero-Allocation 版)
 PointXZ mont_ladder(const PointXZ& P, cpp_int k, const cpp_int& A24_mont, const MontgomeryContext& ctx, const cpp_int& N) {
     if (k == 0) return {ctx.to_mont(1), 0};
     
     PointXZ R0 = P;
-    PointXZ R1 = xDBL(P, A24_mont, ctx, N);
+    PointXZ R1;
+    ctx.xDBL(R1, P, A24_mont);
     
-    int bits = 0;
-    cpp_int temp = k;
-    while(temp > 0) { bits++; temp >>= 1; }
+    // ★ C++の演算子を使わず、GMPAPIで直接ビット数とビット値を抽出 (malloc回避)
+    size_t bits = mpz_sizeinbase(k.get_mpz_t(), 2);
     
-    // 最上位ビット(常に1)の次は bits - 2 からスタート
-    for (int i = bits - 2; i >= 0; --i) {
-        bool bit = ((k >> i) & 1) == 1;
+    for (int i = (int)bits - 2; i >= 0; --i) {
+        bool bit = mpz_tstbit(k.get_mpz_t(), i);
         if (!bit) {
-            R1 = xADD(R0, R1, P, ctx, N);
-            R0 = xDBL(R0, A24_mont, ctx, N);
+            ctx.xADD(R1, R0, R1, P);    // R1 を上書き
+            ctx.xDBL(R0, R0, A24_mont); // R0 を上書き
         } else {
-            R0 = xADD(R0, R1, P, ctx, N);
-            R1 = xDBL(R1, A24_mont, ctx, N);
+            ctx.xADD(R0, R0, R1, P);    // R0 を上書き
+            ctx.xDBL(R1, R1, A24_mont); // R1 を上書き
         }
     }
     return R0;
@@ -453,7 +529,47 @@ struct Poly {
     }
 };
 
-// クロネッカー代入を用いた高速多項式乗算 (mod N)
+// =================================================================
+// 補助関数：分割統治法による O(N log N) パッキング
+// =================================================================
+cpp_int pack_poly(const std::vector<cpp_int>& coef, int left, int right, int K) {
+    if (left == right) {
+        return coef[left];
+    }
+    int mid = left + (right - left) / 2;
+    cpp_int P_left = pack_poly(coef, left, mid, K);
+    cpp_int P_right = pack_poly(coef, mid + 1, right, K);
+    
+    // 右半分をシフトして左半分と足す
+    int shift = (mid - left + 1) * K;
+    return P_left + (P_right << shift);
+}
+
+// =================================================================
+// 補助関数：分割統治法による O(N log N) アンパッキング
+// =================================================================
+void unpack_poly(const cpp_int& packed, int left, int right, int K, const cpp_int& mask, const cpp_int& N, std::vector<cpp_int>& result) {
+    if (left == right) {
+        result[left] = mod(packed & mask, N);
+        return;
+    }
+    int mid = left + (right - left) / 2;
+    int shift = (mid - left + 1) * K;
+    
+    // 下位ビットを抽出するためのマスク
+    cpp_int lower_mask = (cpp_int(1) << shift) - 1;
+    
+    // 巨大な数を「左半分」と「右半分」に分割
+    cpp_int P_left = packed & lower_mask;
+    cpp_int P_right = packed >> shift;
+    
+    unpack_poly(P_left, left, mid, K, mask, N, result);
+    unpack_poly(P_right, mid + 1, right, K, mask, N, result);
+}
+
+// =================================================================
+// 超高速化版: クロネッカー代入を用いた高速多項式乗算 (mod N)
+// =================================================================
 Poly kronecker_multiply(const Poly& A, const Poly& B, const cpp_int& N) {
     if (A.degree() < 0 || B.degree() < 0) return Poly();
 
@@ -461,42 +577,30 @@ Poly kronecker_multiply(const Poly& A, const Poly& B, const cpp_int& N) {
     int m = B.degree();
     int min_len = std::min(n + 1, m + 1);
 
-    // Nのビット数を計算
     int bits_N = 0;
     cpp_int temp_N = N;
     while (temp_N > 0) { bits_N++; temp_N >>= 1; }
 
-    // min_len のビット数を計算
     int log2_min = 0;
     int temp_min = min_len;
     while (temp_min > 0) { log2_min++; temp_min >>= 1; }
 
-    // 係数がオーバーフローしないための安全なシフト幅 K
     int K = 2 * bits_N + log2_min + 2;
 
-    // パッキング
-    cpp_int packed_A = 0;
-    for (int i = 0; i <= n; ++i) {
-        packed_A += (A.coef[i] << (i * K));
-    }
+    // ★ 改善点 1: 分割統治法で高速パッキング
+    cpp_int packed_A = pack_poly(A.coef, 0, n, K);
+    cpp_int packed_B = pack_poly(B.coef, 0, m, K);
 
-    cpp_int packed_B = 0;
-    for (int i = 0; i <= m; ++i) {
-        packed_B += (B.coef[i] << (i * K));
-    }
-
-    // GMPの巨大整数乗算
+    // GMPによる本物のFFT巨大整数乗算 (ここが一番重くなるのが正常)
     cpp_int packed_C = packed_A * packed_B;
 
-    // アンパックと mod N
+    // ★ 改善点 2: 分割統治法で高速アンパッキング
     Poly C;
     C.coef.resize(n + m + 1, 0);
     cpp_int mask = (cpp_int(1) << K) - 1;
+    
+    unpack_poly(packed_C, 0, n + m, K, mask, N, C.coef);
 
-    for (int i = 0; i <= n + m; ++i) {
-        cpp_int coeff = (packed_C >> (i * K)) & mask;
-        C.coef[i] = mod(coeff, N);
-    }
     C.clean();
     return C;
 }
@@ -525,13 +629,15 @@ Poly poly_mod_monic(Poly A, const Poly& B, const cpp_int& N) {
     int degB = B.degree();
     if (degB < 0) return A;
     
-    // 多項式の筆算（長除算）
+    // 多項式の筆算（テンポラリ変数を排除し、直接配列を書き換える）
     while (A.degree() >= degB) {
         int d = A.degree() - degB;
         cpp_int factor = A.coef.back();
         for (int i = 0; i <= degB; ++i) {
-            cpp_int term = mod(B.coef[i] * factor, N);
-            A.coef[i + d] = mod(A.coef[i + d] - term, N);
+            // mod() 関数の呼び出しを避け、直接インプレースで減算と剰余を実行
+            A.coef[i + d] -= B.coef[i] * factor;
+            A.coef[i + d] %= N;
+            if (A.coef[i + d] < 0) A.coef[i + d] += N;
         }
         A.clean();
     }
@@ -540,10 +646,8 @@ Poly poly_mod_monic(Poly A, const Poly& B, const cpp_int& N) {
 
 // 評価対象の点群から、多項式除算用の木（Subproduct Tree）を構築
 void build_eval_tree(int node, const std::vector<cpp_int>& points, int left, int right, const cpp_int& N, std::vector<Poly>& tree) {
-    if ((int)tree.size() <= node) tree.resize(node + 1);
-    
     if (left == right) {
-        tree[node] = Poly({mod(-points[left], N), 1}); // (X - p)
+        tree[node] = Poly({mod(-points[left], N), 1});
         return;
     }
     int mid = left + (right - left) / 2;
@@ -656,69 +760,96 @@ val run_ecm_batch(std::string n_str, int B1, int seed, int num_curves) {
         // 【新生フェーズ 2】 多項式多点評価 (FFTベース)
         // ==========================================
         if (global_ecm_state.found_factor == 0) {
-            int B2 = B1 * 50; 
-            int D = 210;      
-            int coprimes[] = {1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 
-                              53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103};
+            // ★ FFTの恩恵を最大化するため、B2 を B1 の 500倍 に設定（GMP-ECM標準クラス）
+            int B2 = B1 * 500; 
+            setup_phase2_params(B2);
             
-            // 1. Baby-step のアフィンX座標を集める
-            std::vector<cpp_int> baby_x;
-            for (int j : coprimes) {
+            // 1. Baby-step のアフィンX座標をバッチ逆元で集める
+            std::vector<PointXZ> baby_steps;
+            std::vector<cpp_int> baby_z;
+            for (int j : current_phase2_coprimes) { // ★ 動的リストを参照
                 PointXZ step = mont_ladder(P_XZ, j, A24_mont, ctx, N);
-                // 射影座標からアフィン座標 X/Z への変換
-                cpp_int x_affine = mod(step.X * modInverse(step.Z, N), N);
-                if (global_ecm_state.found_factor > 0) break;
-                baby_x.push_back(x_affine);
+                baby_steps.push_back(step);
+                baby_z.push_back(step.Z);
             }
             
-            // もしアフィン変換時の modInverse で素因数が見つかれば、ループの最後(結果返却)へ飛ぶ
-            if (global_ecm_state.found_factor > 0) continue;
+            // ★ ここが消えていました：Z座標を一括で逆元に変換
+            if (!batch_inverse(baby_z, N)) continue;
+            
+            // ★ ここが消えていました：X * Z^-1 でアフィンX座標 (baby_x) を計算
+            std::vector<cpp_int> baby_x;
+            for (size_t i = 0; i < baby_steps.size(); ++i) {
+                baby_x.push_back(mod(baby_steps[i].X * baby_z[i], N));
+            }
 
             // 2. Baby-stepの点から 多項式 F(X) = Π(X - x_j) を構築
             Poly F = build_poly_tree(baby_x, 0, baby_x.size() - 1, N);
 
-            // 3. Giant-step のアフィンX座標を集める (差分加算の漸化式を使用)
-            PointXZ DQ = mont_ladder(P_XZ, D, A24_mont, ctx, N);
-            int i_min = B1 / D;
-            int i_max = B2 / D;
+            // 3. Giant-step のアフィンX座標をバッチ逆元で集める
+            PointXZ DQ = mont_ladder(P_XZ, current_phase2_D, A24_mont, ctx, N); // ★ D を current_phase2_D に変更
+            int i_min = B1 / current_phase2_D;
+            int i_max = B2 / current_phase2_D;
             
             int prev_idx = (i_min == 0) ? 1 : i_min - 1;
             PointXZ T_prev = mont_ladder(DQ, prev_idx, A24_mont, ctx, N);
             PointXZ T_curr = mont_ladder(DQ, i_min, A24_mont, ctx, N);
             
-            std::vector<cpp_int> giant_x;
+            std::vector<PointXZ> giant_steps;
+            std::vector<cpp_int> giant_z;
             for (int i = i_min; i <= i_max; ++i) {
-                cpp_int x_affine = mod(T_curr.X * modInverse(T_curr.Z, N), N);
-                if (global_ecm_state.found_factor > 0) break;
-                giant_x.push_back(x_affine);
-                
-                PointXZ T_next = xADD(T_curr, DQ, T_prev, ctx, N);
+                giant_steps.push_back(T_curr);
+                giant_z.push_back(T_curr.Z);
+                PointXZ T_next;
+                ctx.xADD(T_next, T_curr, DQ, T_prev); // ★ ここを変更
                 T_prev = T_curr;
                 T_curr = T_next;
             }
-            if (global_ecm_state.found_factor > 0) continue;
+            
+            // Z座標を一括で逆元に変換
+            if (!batch_inverse(giant_z, N)) continue;
+            
+            // アフィンX座標 (giant_x) を計算
+            std::vector<cpp_int> giant_x;
+            for (size_t i = 0; i < giant_steps.size(); ++i) {
+                giant_x.push_back(mod(giant_steps[i].X * giant_z[i], N));
+            }
 
             // 4. Giant-stepの点から評価ツリーを構築し、F(X) を一気に代入して割り算
             std::vector<Poly> eval_tree;
+            eval_tree.resize(4 * giant_x.size()); 
             build_eval_tree(1, giant_x, 0, giant_x.size() - 1, N, eval_tree);
             
             std::vector<cpp_int> eval_results;
+            eval_results.reserve(giant_x.size()); 
             evaluate_down(1, F, 0, giant_x.size() - 1, N, eval_tree, eval_results);
 
-            // 5. すべての評価値 F(x_giant) の積を取り、NとのGCDを計算
+            // 5. すべての評価値 F(x_giant) の積を取り、定期的に GCD を計算
             cpp_int accum = 1;
+            int batch_count = 0;
             for (const cpp_int& res : eval_results) {
                 if (res == 0) continue;
-                accum = mod(accum * res, N);
+                accum = (accum * res) % N;
+                
+                if (++batch_count % 128 == 0) {
+                    cpp_int d = gcd(accum, N);
+                    if (d > 1 && d < N) {
+                        global_ecm_state.found_factor = d;
+                        global_ecm_state.phase = 2; 
+                        global_ecm_state.final_Z = accum;
+                        break;
+                    }
+                }
             }
             
-            cpp_int d = gcd(accum, N);
-            if (d > 1 && d < N) {
-                global_ecm_state.found_factor = d;
-                global_ecm_state.phase = 2; 
-                global_ecm_state.final_Z = accum; // 代替として記録
-            } else if (d == N) {
-                global_ecm_state.found_factor = N;
+            if (global_ecm_state.found_factor == 0 && batch_count % 128 != 0) {
+                cpp_int d = gcd(accum, N);
+                if (d > 1 && d < N) {
+                    global_ecm_state.found_factor = d;
+                    global_ecm_state.phase = 2; 
+                    global_ecm_state.final_Z = accum;
+                } else if (d == N) {
+                    global_ecm_state.found_factor = N;
+                }
             }
         }
 

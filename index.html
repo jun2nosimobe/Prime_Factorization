@@ -74,6 +74,9 @@
         let readyWorkers = 0;
         let idleWorkers = []; 
         let mainThreadReady = false;
+        
+        // ★追加: Worker側の変更なしにメインスレッド側でフェーズを安全に管理する
+        let workerPhases = {}; 
 
         function appendLog(text, className = "") {
             const div = document.createElement('div');
@@ -87,14 +90,14 @@
             statusBar.textContent = text;
         }
 
-        // Workerプールをゼロから構築（再起動）する関数
-        function initWorkers(isRestart = false) {
+        // ★修正: 停止時や完了時にWorkerを完全に破棄してCPUを解放できるように引数を追加
+        function initWorkers(isRestart = false, autoStartNext = false) {
             if (isRestart) {
-                // 既存のWorkerをすべて強制終了（CPUリソースを即時解放）
-                workers.forEach(w => w.terminate());
+                workers.forEach(w => w.terminate()); // 全スレッドを強制キル
                 workers = [];
                 idleWorkers = [];
                 readyWorkers = 0;
+                workerPhases = {}; 
             } else {
                 appendLog(`[システム] CPUコア数を検知: ${MAX_WORKERS} スレッドで並列処理モードを準備中...`, "dim");
             }
@@ -110,9 +113,11 @@
                                 appendLog(`[システム] メインスレッド ＆ 全 ${MAX_WORKERS} スレッドの初期化完了。`, "success");
                                 startBtn.disabled = false;
                                 updateStatus("待機中... (準備完了)");
-                            } else {
-                                // 再起動時はすぐに次のターゲットの処理を再開
+                            } else if (autoStartNext) {
                                 setTimeout(processNextTarget, 10);
+                            } else {
+                                startBtn.disabled = false;
+                                updateStatus("待機中... (リセット完了)");
                             }
                         }
                     } else if (e.data.type === 'result') {
@@ -132,28 +137,25 @@
             }
         };
 
-        // 初回起動
         initWorkers();
 
         // -------------------------------------------------
-        // グローバルな状態管理と深層探索スケール
+        // グローバルな状態管理
         // -------------------------------------------------
         let unprocessed = [];
         let primeFactors = [];
         let currentN = null;
         let startTime = 0;
         
-        // 70桁〜100桁（35〜50桁の素因数）を撃ち抜くためのガチ勢用スケール
-        // B1が巨大になると1曲線の計算に時間がかかるため、batchSizeを減らしてUIの更新頻度を保ちます
         let ecmPhases = [
-            { B1: 2000,      maxCurves: 25,    batchSize: 2 },   // ~15桁の素因数
-            { B1: 11000,     maxCurves: 90,    batchSize: 2 },  // ~20桁
-            { B1: 50000,     maxCurves: 300,   batchSize: 2 },  // ~25桁
-            { B1: 250000,    maxCurves: 700,   batchSize: 2 },  // ~30桁
-            { B1: 1000000,   maxCurves: 1800,  batchSize: 2 },  // ~35桁
-            { B1: 3000000,   maxCurves: 4000,  batchSize: 2 },  // ~40桁 (ここから先は非常に重い)
-            { B1: 11000000,  maxCurves: 8000,  batchSize: 2 },   // ~45桁
-            { B1: 43000000,  maxCurves: 20000, batchSize: 2 }    // ~50桁
+            { B1: 2000,      maxCurves: 25,    batchSize: 5 },
+            { B1: 11000,     maxCurves: 90,    batchSize: 3 },
+            { B1: 50000,     maxCurves: 300,   batchSize: 2 },
+            { B1: 250000,    maxCurves: 700,   batchSize: 1 },
+            { B1: 1000000,   maxCurves: 1800,  batchSize: 1 },
+            { B1: 3000000,   maxCurves: 4000,  batchSize: 1 },
+            { B1: 11000000,  maxCurves: 8000,  batchSize: 1 },
+            { B1: 43000000,  maxCurves: 20000, batchSize: 1 } 
         ];
         let currentPhaseIdx = 0;
         let B1 = ecmPhases[0].B1;
@@ -166,7 +168,8 @@
         // -------------------------------------------------
         startBtn.onclick = function() {
             const n_str = document.getElementById('targetN').value.trim();
-            if(!n_str || !/^\d+$/.test(n_str)) {
+            // ★ 修正: 先頭のマイナス (-) を許容するように変更
+            if(!n_str || !/^-?\d+$/.test(n_str)) {
                 alert("正しい数値を入力してください。");
                 return;
             }
@@ -188,6 +191,7 @@
 
         stopBtn.onclick = function() { 
             stopRequested = true; 
+            updateStatus("停止処理中... (スレッド終了待ち)");
         };
 
         function processNextTarget() {
@@ -202,6 +206,27 @@
             
             currentN = unprocessed.shift();
             targetResolved = false;
+            
+            // ==========================================
+            // ★追加: 0, 1, および負数の特殊ケースガード
+            // ==========================================
+            if (currentN <= 1n) {
+                if (currentN === 1n) {
+                    appendLog(`[確認] 1 は素因数分解の対象外（単位元）です。`, "dim");
+                    primeFactors.push(currentN);
+                } else if (currentN === 0n) {
+                    appendLog(`[確認] 0 は分解できません。`, "dim");
+                    primeFactors.push(currentN);
+                } else {
+                    appendLog(`[確認] 負数(${currentN})です。`, "dim");
+                    primeFactors.push(-1n); // 負の符号を抽出
+                    currentN = -currentN;
+                    if (currentN > 1n) unprocessed.push(currentN);
+                }
+                currentN = null;
+                setTimeout(processNextTarget, 10);
+                return;
+            }
             
             if (currentN < 1000n) {
                 appendLog(`\n>>> ターゲット: ${currentN} (小数のため試行除法で処理) <<<`, "highlight");
@@ -281,6 +306,8 @@
                 const workerId = idleWorkers.shift();
                 const seed = Math.floor(Math.random() * 1000000000);
                 
+                workerPhases[workerId] = currentPhaseIdx; // ★修正: メインスレッド側で実行フェーズを記録
+                
                 workers[workerId].postMessage({
                     cmd: 'run_ecm',
                     workerId: workerId,
@@ -293,12 +320,10 @@
         }
 
         function handleWorkerResult(result) {
-            // すでに他スレッドで発見済みなら無視（※再起動までのラグ用）
-            if (targetResolved || stopRequested) return;
+            // ★修正: 結果が返ってきたら、何があってもまずは待機列に戻す（ゾンビ化防止）
+            idleWorkers.push(result.workerId);
 
-            totalCurves += result.curves_tried;
-            curvesTriedInPhase += result.curves_tried;
-            updateStatus(`[ECM並列] フェーズ${currentPhaseIdx+1} (B1=${B1}) | 試行曲線: ${totalCurves} 個目`);
+            if (targetResolved || stopRequested) return;
 
             if (result.status === "found") {
                 targetResolved = true; 
@@ -310,7 +335,14 @@
                 
                 let detailHtml = `<b>[アルゴリズム詳細解説]</b><br>`;
                 detailHtml += `ターゲット: N = ${currentN}<br><br>`;
-                detailHtml += `ヒットした曲線 (A24): A = ${result.A}<br>`;
+                
+                // ★ 曲線の数式と初期点を明示するUI
+                detailHtml += `<div style="background: #002200; padding: 10px; border: 1px solid #00e676; margin-bottom: 10px;">`;
+                detailHtml += `<span style="color:#aaffaa;">使用したモントゴメリ曲線:</span><br>`;
+                detailHtml += `<span style="color:#ffcc00; font-size: 1.2em;">E : y² = x³ + ${result.A}x² + x  (mod N)</span><br><br>`;
+                detailHtml += `<span style="color:#aaffaa;">初期点 (アフィンX座標):</span><br>`;
+                detailHtml += `<span style="color:#ffcc00;">P₀_x = ${result.P_x}</span><br>`;
+                detailHtml += `</div>`;
                 
                 if (result.phase === 1) {
                     detailHtml += `<b style="color:#66ccff;">【フェーズ1 (B1) で的中】</b><br>`;
@@ -330,13 +362,17 @@
                 if (q > 1n) unprocessed.push(q);
                 currentN = null;
                 
-                // ★ 改善ポイント: 素因数発見と同時に、重い計算をしている全Workerを強制Killして作り直す
                 appendLog(`[システム] 他スレッドの重い計算を強制中断し、Workerを再起動します...`, "dim");
-                initWorkers(true); 
+                initWorkers(true, true); // ★ 再起動完了後、自動で次の分解を再開する
+                return;
+            } 
+            
+            // ★修正: メインスレッド側で記録していたフェーズと照合する
+            if (workerPhases[result.workerId] === currentPhaseIdx) {
+                totalCurves += result.curves_tried;
+                curvesTriedInPhase += result.curves_tried;
+                updateStatus(`[ECM並列] フェーズ${currentPhaseIdx+1} (B1=${B1}) | 試行曲線: ${totalCurves} 個目`);
 
-            } else {
-                idleWorkers.push(result.workerId);
-                
                 if (curvesTriedInPhase >= ecmPhases[currentPhaseIdx].maxCurves) {
                     currentPhaseIdx++;
                     if (currentPhaseIdx < ecmPhases.length) {
@@ -350,8 +386,8 @@
                         appendLog(`<span class="dim">...一周完了。新しい曲線セットで初期フェーズから再挑戦します</span>`);
                     }
                 }
-                dispatchJobs();
             }
+            dispatchJobs();
         }
 
         function finish(primes, composites) {
@@ -372,6 +408,9 @@
             startBtn.disabled = false;
             stopBtn.disabled = true;
             appendLog("\n🛑 処理が完了しました。");
+            
+            // ★修正: 完了時・停止時に、裏で回っているWasmの息の根を完全に止めてCPU稼働率を0%に戻す
+            initWorkers(true, false);
         }
     </script>
 </body>
