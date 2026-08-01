@@ -70,6 +70,7 @@ bool is_prime_cpp(const std::string& n_str) {
 // ポラード・ロー法
 std::string pollard_rho(const std::string& n_str, int max_steps) {
     cpp_int n(n_str);
+    if (n <= 1) return "";
     if (n % 2 == 0) return "2";
     
     cpp_int x = 2;
@@ -106,10 +107,10 @@ val run_ecm_batch(std::string n_str, int B1, int seed, int num_curves) {
     
     if (bits <= 384) {
         // ★ 将来 uint384_t の実装が完了したら以下に切り替えます
-        // return run_ecm_core<uint384_t, MontgomeryContext384>(n_str, B1, seed, num_curves);
+        return run_ecm_core<uint384_t, MontgomeryContext384>(n_str, B1, seed, num_curves);
         
         // 現在は従来通りの GMP エンジンへルーティング
-        return run_ecm_core<cpp_int, MontgomeryContextGMP>(n_str, B1, seed, num_curves);
+        //return run_ecm_core<cpp_int, MontgomeryContextGMP>(n_str, B1, seed, num_curves);
     } else {
         // 384ビットを超える場合は従来の汎用 GMP エンジンへルーティング
         return run_ecm_core<cpp_int, MontgomeryContextGMP>(n_str, B1, seed, num_curves);

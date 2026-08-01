@@ -167,6 +167,14 @@
 
             for (let i = 0; i < MAX_WORKERS; i++) {
                 const worker = new Worker('ecm_worker.js');
+                
+                // ★追加: Workerがクラッシュした際のエラーキャッチ
+                worker.onerror = function(error) {
+                    console.error(`Worker ${i} crashed:`, error);
+                    appendLog(`❌ [致命的エラー] スレッド ${i} が異常終了しました。コンソールを確認してください。`, "highlight");
+                    // 死んだWorkerをidleWorkersに戻さないことで無限ループを防ぐ
+                };
+
                 worker.onmessage = function(e) {
                     if (e.data.type === 'ready') {
                         readyWorkers++;
@@ -208,7 +216,7 @@
         let unprocessed = [];
         let primeFactors = [];
         let currentN = null;
-        
+
         let ecmPhases = [
             { B1: 2000,      maxCurves: 25,    batchSize: 5 },
             { B1: 11000,     maxCurves: 90,    batchSize: 3 },
@@ -228,9 +236,9 @@
         // -------------------------------------------------
         // コア・ロジック
         // -------------------------------------------------
+       
         startBtn.onclick = function() {
             const n_str = document.getElementById('targetN').value.trim();
-            // ★ 修正: 先頭のマイナス (-) を許容するように変更
             if(!n_str || !/^-?\d+$/.test(n_str)) {
                 alert("正しい数値を入力してください。");
                 return;
@@ -243,16 +251,18 @@
             startBtn.disabled = true;
             stopBtn.disabled = false;
             
+            // ★追加: 開始直後にステータスを更新
+            updateStatus("実行中...");
+            
             unprocessed = [BigInt(n_str)];
             primeFactors = [];
             currentN = null;
             startTime = Date.now();
 
-            // ★追加: 1秒ごとにステータスバーのタイマー表示を更新
             if (globalTimer) clearInterval(globalTimer);
             globalTimer = setInterval(updateStatusDisplay, 1000);
 
-            processNextTarget();
+            setTimeout(processNextTarget, 10);
         };
 
         stopBtn.onclick = function() { 
@@ -335,31 +345,37 @@
                 updateStatus(`[ロー法] 小さな素因数を探索中...`);
                 appendLog(`<span class="dim">ポラード・ロー法 (x = x^2 + c mod N) で探索中...</span>`);
                 
-                let steps = (mode === "rho_only") ? 5000000 : 100000;
-                const factor_str = Module.pollard_rho(currentN.toString(), steps);
-                
-                if (factor_str !== "") {
-                    const p = BigInt(factor_str);
-                    const q = currentN / p;
-                    appendLog(`🎉 <b>ロー法で発見:</b> ${currentN} = ${p} × ${q}`, "success");
-                    if (p > 1n) unprocessed.push(p);
-                    if (q > 1n) unprocessed.push(q);
-                    currentN = null;
-                    setTimeout(processNextTarget, 10);
-                    return;
-                } else {
-                    if (mode === "rho_only") {
-                        appendLog(`❌ ロー法では時間内に見つかりませんでした。`, "highlight");
-                        unprocessed.push(currentN);
+                // ★修正: ログを確実に画面に描画させるため、重いWasm処理を非同期(setTimeout)の中に閉じ込める
+                setTimeout(() => {
+                    let steps = (mode === "rho_only") ? 5000000 : 100000;
+                    const factor_str = Module.pollard_rho(currentN.toString(), steps);
+                    
+                    if (factor_str !== "") {
+                        const p = BigInt(factor_str);
+                        const q = currentN / p;
+                        appendLog(`🎉 <b>ロー法で発見:</b> ${currentN} = ${p} × ${q}`, "success");
+                        if (p > 1n) unprocessed.push(p);
+                        if (q > 1n) unprocessed.push(q);
                         currentN = null;
-                        stopRequested = true;
                         setTimeout(processNextTarget, 10);
-                        return;
                     } else {
-                        appendLog(`<span class="dim">  -> ロー法では見つからず。ECMに並列移行します。</span>`);
+                        if (mode === "rho_only") {
+                            appendLog(`❌ ロー法では時間内に見つかりませんでした。`, "highlight");
+                            unprocessed.push(currentN);
+                            currentN = null;
+                            stopRequested = true;
+                            setTimeout(processNextTarget, 10);
+                        } else {
+                            appendLog(`<span class="dim">  -> ロー法では見つからず。ECMに並列移行します。</span>`);
+                            dispatchJobs(); // ★ ロー法が終わってからECMのジョブを投げる
+                        }
                     }
-                }
+                }, 50); // 50ミリ秒待機してDOMを更新させる
+                
+                return; // ★重要: setTimeoutをセットしたら、この関数は一旦ここで終了させる
             }
+            
+            // ecm_only の場合
             dispatchJobs();
         }
 
@@ -386,10 +402,24 @@
         }
 
         function handleWorkerResult(result) {
+            // ★ 追加: Workerから返ってきた生のデータをすべてF12コンソールに出力
+            console.log(`[JS監視] Worker ${result.workerId} から応答 | ステータス: ${result.status} | 試行数: ${result.curves_tried} | フェーズ: ${currentPhaseIdx+1} (B1=${B1})`);
+            if (result.status === "found") {
+                console.log(`[JS監視] 🎉 因数発見データ:`, result);
+            }
+
             // ★修正: 結果が返ってきたら、何があってもまずは待機列に戻す（ゾンビ化防止）
             idleWorkers.push(result.workerId);
 
-            if (targetResolved || stopRequested) return;
+            // ★修正: 停止要求が出ている場合は、すべてのWorkerが帰還次第 finish を呼ぶ
+            if (stopRequested) {
+                if (idleWorkers.length === MAX_WORKERS) {
+                    finish(primeFactors, unprocessed.concat(currentN ? [currentN] : []));
+                }
+                return;
+            }
+
+            if (targetResolved) return;
 
             if (result.status === "found") {
                 targetResolved = true; 
@@ -410,7 +440,11 @@
                 detailHtml += `<span style="color:#ffcc00;">P₀_x = ${result.P_x}</span><br>`;
                 detailHtml += `</div>`;
                 
-                if (result.phase === 1) {
+                if (result.phase === 0) {
+                    // ★ 追加: 初期化ヒット用の表示
+                    detailHtml += `<b style="color:#ff9800;">【フェーズ0 (曲線初期化) で的中】</b><br>`;
+                    detailHtml += `曲線を生成するための拡張ユークリッド互除法（逆元計算）の最中に、偶然にも因数との衝突を検知しました！（一撃必殺）<br>`;
+                } else if (result.phase === 1) {
                     detailHtml += `<b style="color:#66ccff;">【フェーズ1 (B1) で的中】</b><br>`;
                     detailHtml += `素数 <b style="color:white">${result.prime}</b> のべき乗（k = ${result.k}）によるスカラー倍完了時に発覚。<br>`;
                 } else {
